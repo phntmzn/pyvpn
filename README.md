@@ -1,13 +1,14 @@
-# 🔒 PyVPN — Simple Python VPN
+# 🔒 PyVPN — Python VPN with Production Security Features
 
-A lightweight, encrypted VPN tunnel built in Python using TUN interfaces and AES-256-GCM authenticated encryption over UDP. Built for learning, experimentation, and understanding how VPNs work under the hood.
+A lightweight VPN tunnel built in Python featuring mutual certificate authentication, ephemeral ECDH key exchange (perfect forward secrecy), replay attack protection, keepalive/dead-peer detection, and automatic reconnection with exponential backoff.
 
-> ⚠️ **Disclaimer:** This is an educational project. For production environments, use battle-tested solutions like [WireGuard](https://www.wireguard.com/) or [OpenVPN](https://openvpn.net/). This implementation lacks features like certificate-based authentication, key exchange protocols, and reconnection logic that production VPNs require.
+> ⚠️ **Disclaimer:** This is an educational/hobbyist project demonstrating how production VPN security features work. For critical infrastructure, use [WireGuard](https://www.wireguard.com/) or [OpenVPN](https://openvpn.net/).
 
 ---
 
 ## Table of Contents
 
+- [What's New](#whats-new)
 - [How It Works](#how-it-works)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
@@ -22,27 +23,59 @@ A lightweight, encrypted VPN tunnel built in Python using TUN interfaces and AES
 
 ---
 
+## What's New
+
+This version adds the three major security and reliability features that were missing from the original:
+
+| Feature | How it's implemented |
+|---------|---------------------|
+| **Certificate-based authentication** | Mutual X.509 cert verification during handshake — both sides verify the other was signed by the trusted CA |
+| **Ephemeral key exchange** | X25519 ECDH per session, keys derived via HKDF — provides perfect forward secrecy |
+| **Reconnection logic** | Client auto-reconnects with exponential backoff (2s → 4s → ... → 60s cap) |
+| **Replay attack protection** | 64-bit sequence numbers + sliding window (128 slots) — replayed or duplicate packets are dropped |
+| **Keepalive / dead-peer detection** | Heartbeat every 15s, peer timeout at 45s — broken connections are detected and recovered quickly |
+
+A new helper script `gen_certs.py` generates the CA, server certificate, and client certificate needed for mutual auth.
+
+---
+
 ## How It Works
 
-PyVPN creates an encrypted tunnel between two machines using the following approach:
+PyVPN creates an encrypted tunnel between two machines in two phases: **handshake** and **data forwarding**.
 
-1. A virtual **TUN network interface** (`tun0`) is created on both the server and client.
-2. The OS routes IP packets into this interface just like any other network interface.
-3. PyVPN reads packets out of the TUN, **encrypts them** using AES-256-GCM, and sends them over a standard UDP socket to the other end.
-4. The receiving side **decrypts** the packet and writes it back into its own TUN interface, where the OS picks it up and processes it normally.
+### Handshake (mutual authentication + key exchange)
 
-From the operating system's perspective, it's just sending packets to a network interface. The encryption and tunneling are entirely transparent.
+```
+Client                                          Server
+  │                                               │
+  ├─── ClientHello ──────────────────────────────►│
+  │    { ecdh_pub, cert_pem, sig }                │
+  │                                               │  verify client cert (CA chain)
+  │                                               │  verify sig(ecdh_pub)
+  │                                               │  generate server ECDH key pair
+  │◄─── ServerHello ──────────────────────────────┤
+  │     { ecdh_pub, cert_pem, sig }               │
+  │                                               │
+  │  verify server cert (CA chain)                │
+  │  verify sig(ecdh_pub)                         │
+  │                                               │
+  ╠══ both sides: X25519(priv, peer_pub) → HKDF → session_key ══╣
+  │                                               │
+  │◄══════════ AES-256-GCM encrypted tunnel ══════►│
+```
+
+### Data forwarding
 
 ```
 [Your App]
     ↓ normal IP packet
 [tun0 interface]
     ↓ PyVPN reads packet
-[AES-256-GCM encrypt]
+[seq++ | AES-256-GCM encrypt]
     ↓ encrypted UDP datagram
 [Internet / Network]
     ↓ encrypted UDP datagram
-[AES-256-GCM decrypt]
+[AES-256-GCM decrypt | replay check]
     ↓ original IP packet
 [tun0 interface]
     ↓ injected into OS
@@ -54,19 +87,22 @@ From the operating system's perspective, it's just sending packets to a network 
 ## Architecture
 
 ```
+gen_certs.py        — One-time certificate generation (CA + server + client)
 vpn_server.py       — Runs on the remote/cloud machine
 vpn_client.py       — Runs on your local machine
 ```
 
-Both scripts share the same core logic:
+Key components:
 
 | Component | Description |
 |-----------|-------------|
-| `create_tun()` | Opens `/dev/net/tun` and creates a virtual TUN interface |
-| `configure_interface()` | Assigns IPs and sets MTU via `ip` commands |
-| `encrypt()` | Generates a random 12-byte nonce and encrypts with AES-256-GCM |
-| `decrypt()` | Extracts the nonce and decrypts the ciphertext |
-| `select()` loop | Watches both the TUN fd and UDP socket simultaneously, forwarding packets in both directions |
+| `gen_certs.py` | Generates a CA, server cert, and client cert using ECDSA P-256 |
+| `perform_handshake()` | Mutual cert verification + X25519 ECDH + HKDF key derivation |
+| `encrypt_packet()` | Prepends type byte + 8-byte seq, then AES-256-GCM with random nonce |
+| `decrypt_packet()` | Decrypts and returns `(type, seq, payload)` |
+| `ReplayWindow` | Sliding window tracking last 128 sequence numbers |
+| `ClientSession` | Tracks session key, sequence counter, replay window, and last-seen time |
+| `select()` loop | Multiplexes TUN reads, UDP reads, keepalive timer, and dead-peer detection |
 
 **Virtual IP layout (default):**
 
@@ -112,20 +148,34 @@ cd pyvpn
 pip install cryptography
 ```
 
-**3. Generate a shared secret key**
+**3. Generate certificates**
 
-Both the server and client must use the same 32-byte (256-bit) key. Generate one with:
+Run `gen_certs.py` once to create your CA and signed certificates. Pass your server's public IP so the certificate's Subject Alternative Name is correct.
 
 ```bash
-python3 -c "import os; print(os.urandom(32).hex())"
+python3 gen_certs.py --out-dir ./certs --server-ip 203.0.113.42
 ```
 
-Example output:
+This creates:
+
 ```
-a3f1c2d4e5b6a7f8091a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4b5c6d
+certs/
+  ca.crt        ← shared trust anchor (copy to both machines)
+  ca.key        ← keep offline after signing — not needed at runtime
+  server.crt    ← server identity certificate
+  server.key    ← server private key
+  client.crt    ← client identity certificate
+  client.key    ← client private key
 ```
 
-Save this key securely — anyone with this key can decrypt your VPN traffic.
+**4. Distribute files to each machine**
+
+```
+Server machine needs:   ca.crt  server.crt  server.key
+Client machine needs:   ca.crt  client.crt  client.key
+```
+
+Use `scp` or another secure channel — never send private keys unencrypted.
 
 ---
 
@@ -135,31 +185,34 @@ Save this key securely — anyone with this key can decrypt your VPN traffic.
 
 ```bash
 sudo python3 vpn_server.py \
+  --cert certs/server.crt \
+  --key  certs/server.key \
+  --ca   certs/ca.crt \
   --host 0.0.0.0 \
-  --port 5000 \
-  --key a3f1c2d4e5b6a7f8091a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4b5c6d
+  --port 5000
 ```
 
 The server will:
 - Create a `tun0` interface with IP `10.8.0.1`
 - Listen on UDP port `5000` for incoming connections
-- Log the client's address when it first connects
+- Perform mutual certificate authentication before accepting any traffic
+- Derive a fresh session key for each new client connection
 
 ### On the Client (your local machine)
 
 ```bash
 sudo python3 vpn_client.py \
   --server 203.0.113.42 \
-  --port 5000 \
-  --key a3f1c2d4e5b6a7f8091a2b3c4d5e6f7081920a1b2c3d4e5f60718293a4b5c6d
+  --cert certs/client.crt \
+  --key  certs/client.key \
+  --ca   certs/ca.crt
 ```
-
-Replace `203.0.113.42` with your server's public IP address.
 
 The client will:
 - Create a `tun0` interface with IP `10.8.0.2`
-- Send a handshake packet so the server learns the client's address
-- Begin forwarding packets in both directions
+- Perform the ECDH handshake and verify the server's certificate
+- Begin forwarding packets, sending keepalives every 15 seconds
+- Automatically reconnect if the connection drops
 
 ### Verify the tunnel is working
 
@@ -175,26 +228,43 @@ If you get replies, the VPN tunnel is up and working.
 
 ## Configuration
 
-### Server options
+### Certificate generation options (`gen_certs.py`)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--out-dir` | `./certs` | Directory to write certificate files |
+| `--server-cn` | `pyvpn-server` | Server certificate common name |
+| `--client-cn` | `pyvpn-client` | Client certificate common name |
+| `--server-ip` | *(none)* | Add an IP SAN to the server cert (repeatable) |
+| `--server-dns` | *(none)* | Add a DNS SAN to the server cert (repeatable) |
+| `--days-ca` | `3650` | CA validity period in days (default: 10 years) |
+| `--days-leaf` | `365` | Server/client cert validity in days (default: 1 year) |
+
+### Server options (`vpn_server.py`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host` | `0.0.0.0` | Interface to listen on |
 | `--port` | `5000` | UDP port to listen on |
-| `--key` | *(required)* | 32-byte hex-encoded pre-shared key |
+| `--cert` | *(required)* | Path to server certificate PEM |
+| `--key` | *(required)* | Path to server private key PEM |
+| `--ca` | *(required)* | Path to CA certificate PEM |
 | `--tun-ip` | `10.8.0.1` | Server-side TUN interface IP |
-| `--client-ip` | `10.8.0.2` | Expected client TUN IP (informational) |
+| `--debug` | off | Enable verbose debug logging |
 
-### Client options
+### Client options (`vpn_client.py`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--server` | *(required)* | Server's public IP or hostname |
 | `--port` | `5000` | UDP port to connect to |
-| `--key` | *(required)* | 32-byte hex-encoded pre-shared key |
+| `--cert` | *(required)* | Path to client certificate PEM |
+| `--key` | *(required)* | Path to client private key PEM |
+| `--ca` | *(required)* | Path to CA certificate PEM |
 | `--local-ip` | `10.8.0.2` | Client-side TUN interface IP |
-| `--server-tun-ip` | `10.8.0.1` | Server's TUN IP (used as gateway) |
-| `--route-all` | `false` | Route all internet traffic through VPN |
+| `--server-tun-ip` | `10.8.0.1` | Server's TUN IP (used as VPN gateway) |
+| `--route-all` | off | Route all internet traffic through VPN |
+| `--debug` | off | Enable verbose debug logging |
 
 ---
 
@@ -233,31 +303,41 @@ sudo ip route del <server-ip>/32
 
 ## Security Model
 
-### Encryption
+### Authentication — Mutual X.509 Certificates
 
-PyVPN uses **AES-256-GCM** (Galois/Counter Mode), which provides:
+Both sides present a certificate signed by the shared CA during the handshake. Neither side accepts a connection from a peer whose certificate was not signed by that CA. This means:
 
-- **Confidentiality** — Traffic cannot be read by a passive observer.
-- **Integrity** — Any modification to the ciphertext will cause decryption to fail. Tampered packets are silently dropped.
-- **Authenticity** — Only parties with the pre-shared key can produce valid ciphertexts.
+- A rogue server cannot impersonate the real server (the client will reject its cert).
+- An unauthorized client cannot connect (the server will reject its cert).
+- The CA private key (`ca.key`) can be kept offline after signing — it is never needed at runtime.
 
-Each packet gets a fresh random **12-byte nonce**, prepended to the ciphertext before sending. This means even if the same plaintext is sent twice, the ciphertext will be different each time.
+### Key Exchange — X25519 ECDH + HKDF (Perfect Forward Secrecy)
+
+Each session generates a fresh ephemeral X25519 key pair. The shared secret is derived via X25519 ECDH, then passed through HKDF-SHA256 to produce the 32-byte AES session key. Each side signs its ECDH public key with its certificate private key so the key exchange is authenticated.
+
+Because the ephemeral keys are never stored, recording today's traffic and later stealing the server's certificate private key does not allow decrypting past sessions. This property is called **perfect forward secrecy**.
+
+### Encryption — AES-256-GCM
+
+Each packet is encrypted with AES-256-GCM using a random 12-byte nonce, providing confidentiality, integrity, and authenticity. The packet wire format is:
 
 ```
-Sent packet layout:
-[ 12-byte nonce ][ ciphertext + 16-byte GCM auth tag ]
+[ 12-byte nonce ][ AES-256-GCM ciphertext ]
+    where plaintext = [ type(1) ][ seq(8) ][ payload ]
 ```
 
-### What this implementation does NOT provide
+### Replay Attack Protection
+
+Every packet carries a monotonically increasing 64-bit sequence number inside the ciphertext. The receiver maintains a sliding window of the last 128 sequence numbers. Packets with a sequence number already seen, or older than the window, are silently dropped.
+
+### What this implementation still does NOT provide
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Key exchange (e.g. Diffie-Hellman) | ❌ | Key must be shared out-of-band |
-| Certificate-based identity | ❌ | No way to verify server identity |
-| Perfect forward secrecy | ❌ | Same key used for all sessions |
-| Replay attack protection | ❌ | No sequence numbers or timestamps |
 | Multi-client support | ❌ | One client per server instance |
-| Reconnection / keepalive | ❌ | Must restart manually on disconnect |
+| Certificate revocation (CRL/OCSP) | ❌ | Revoked certs cannot be blocked without restarting |
+| Encrypted handshake | ⚠️ | ClientHello/ServerHello are plaintext (certs visible to observer) |
+| DoS resistance | ❌ | No rate limiting or cookie challenge on handshake |
 
 ---
 
@@ -312,14 +392,13 @@ Python is not ideal for high-throughput packet processing. For better performanc
 
 ## Limitations
 
-This project is intentionally minimal to keep the code readable and educational. Here's what's missing compared to production VPNs:
+This project demonstrates the core techniques used by production VPNs but remains simplified in a few areas:
 
-- **Single client only.** The server tracks one client address at a time. A second client connecting will silently take over.
-- **No key negotiation.** The pre-shared key must be distributed manually and securely (e.g. via SSH).
-- **No identity verification.** There's no way to confirm you're talking to the real server and not a man-in-the-middle (since there are no certificates).
-- **No replay protection.** A recorded packet could theoretically be replayed. Add sequence numbers and a sliding window to mitigate this.
-- **UDP only.** TCP-over-TCP (tunneling TCP inside TCP) performs poorly due to double retransmission. UDP is the right choice here, but adds complexity for unreliable links.
-- **Linux only.** TUN/TAP interfaces work natively on Linux. macOS requires `utun` via system calls, and Windows requires a TAP driver (like the one from OpenVPN).
+- **Single client only.** The server tracks one client session at a time. A second client connecting will replace the first.
+- **Plaintext handshake.** The ClientHello and ServerHello are not encrypted, so a passive observer can see the certificates (though not the traffic). WireGuard encrypts its handshake using ephemeral keys to hide identity.
+- **No certificate revocation.** There is no CRL or OCSP support. To revoke a client, you'd need to reissue the CA or restart the server with a different CA cert.
+- **No DoS protection.** The server processes every handshake request immediately with no rate limiting or cookie challenge. A real VPN would use SYN-cookie-like mechanisms.
+- **Linux only.** TUN/TAP interfaces work natively on Linux. macOS requires `utun` via system calls, and Windows requires a TAP driver.
 
 ---
 
