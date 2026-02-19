@@ -1,0 +1,15 @@
+# Files to include in source distributions (sdist / pip install from source)
+
+include README.md
+include LICENSE
+include pyproject.toml
+
+# Include all PEM examples and the examples folder
+recursive-include examples *.py
+
+# Exclude compiled bytecode and editor artifacts
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude .DS_Store
+global-exclude *.egg-info

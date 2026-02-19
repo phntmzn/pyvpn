@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyvpn"
+version = "2.0.0"
+description = "Importable Python VPN library with mutual TLS auth and perfect forward secrecy"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["vpn", "tun", "tunnel", "encryption", "privacy", "scraping"]
+dependencies = [
+    "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+scraping = [
+    "requests>=2.31",
+    "httpx>=0.25",
+]
+dev = [
+    "requests>=2.31",
+    "httpx>=0.25",
+    "playwright>=1.40",
+]
+
+[project.scripts]
+pyvpn-server   = "pyvpn.server:_main"
+pyvpn-client   = "pyvpn.client_cli:_main"
+pyvpn-gencerts = "pyvpn.certs:_main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyvpn*"]
